@@ -7,7 +7,10 @@ Our implementation extends from https://github.com/epfml/ChocoSGD.
 2. (For Imagenet exp. only) Follow the instructions in [system_setup.md](system_setup.md) to prepare the Imagenet dataset.
 3. (For Imagenet exp. only) Follow the instructions in [torch_build_instruction.md](torch_build_instruction.md) to build PyTorch from source with MPI support for CUDA.
 
-Our experiments are reproducible from a single CPU server (Fig. 2,3,4,5) and a 8-GPU server (Fig. 6).
+Our experiments are reproducible from a single CPU server (Fig. 2, 3, 4, 5) and a 8-GPU server (Fig. 6).
 
 ## Experiments
-Use the bash scripts in `FSPDA/exps`. Each file corresponds to one figure of experiment results in the paper. Our script uses [wandb](https://wandb.ai/) for logging by default.
+Use the bash scripts in `FSPDA/exps`. 
+- Configure `--python_path`, `--mpi_path`, `--mpirun_path` according to your local environment.
+- Each file corresponds to one figure of experiment results in the paper.
+- Our script uses [wandb](https://wandb.ai/) for logging by default.
