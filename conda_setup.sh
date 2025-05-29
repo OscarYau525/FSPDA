@@ -19,11 +19,6 @@ pip install pytelegraf pymongo influxdb kubernetes jinja2
 # sudo apt update
 # sudo apt install -y cmake
 
-# bit2byte
-cd ~
-git clone https://github.com/tvogels/signSGD-with-Majority-Vote.git && cd signSGD-with-Majority-Vote/main/bit2byte-extension/ && python setup.py develop
-
-
 # install other python related softwares.
 # pip install -y opencv protobuf
 pip install networkx
@@ -33,3 +28,7 @@ pip install lmdb tensorboard_logger pyarrow msgpack msgpack_numpy mpi4py
 # pip install -c pip-forge python-blosc
 pip install pillow
 pip install tqdm wandb
+
+# bit2byte
+cd ~
+git clone https://github.com/tvogels/signSGD-with-Majority-Vote.git && cd signSGD-with-Majority-Vote/main/bit2byte-extension/ && python setup.py develop

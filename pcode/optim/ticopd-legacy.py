@@ -13,10 +13,9 @@ from pcode.utils.sparsification import (
     QuantizationCompressor,
 )
 from pcode.utils.tensor_buffer import TensorBuffer
-from random import random
-import torch.distributed as dist
+from math import sqrt
 
-class SPARQ_SGD(Optimizer):
+class TiCoPD(Optimizer):
     def __init__(
         self,
         params,
@@ -37,17 +36,24 @@ class SPARQ_SGD(Optimizer):
         )
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        super(SPARQ_SGD, self).__init__(params, defaults)
+        super(TiCoPD, self).__init__(params, defaults)
 
         # store the whole training arguments.
         self.conf = conf
-        self.c_init = conf.c_init
-        self.c_incre = conf.c_incre
         self.use_cuda = conf.on_cuda
-    
+        self.theta = conf.theta
+        self.eta = conf.eta
+        self.beta = conf.beta
+
         # define the aggregator.
         self.rank = conf.graph.rank
         self.neighbors_info = conf.graph.get_neighborhood()
+        # convert weights into Laplacian matrix values
+        n_neighbors = len(self.neighbors_info) - 1
+        self.neighbors_info[self.rank] = n_neighbors
+        for i in self.neighbors_info:
+            if i != self.rank:
+                self.neighbors_info[i] = -1
         self.aggregator = comm.get_aggregators(
             cur_rank=self.rank,
             world=conf.graph.ranks,
@@ -70,8 +76,12 @@ class SPARQ_SGD(Optimizer):
         self.init_neighbor_hat_params()
         self.consensus_stepsize = conf.consensus_stepsize
 
+        # initialize dual variable lambda
+        for groups in self.param_groups:
+            groups["lambdas"] = [torch.zeros_like(prm) for prm in groups["params"]]
+
         # related to sparsification/quantization.
-        self.compressor = RandomGraphCompressor(
+        self.compressor = CHOCOCompressor(
             aggregator=self.aggregator,
             comm_op=conf.comm_op,
             comm_device=self.conf.comm_device,
@@ -80,15 +90,13 @@ class SPARQ_SGD(Optimizer):
             is_biased=conf.is_biased,
             backend=conf.backend,
             use_ipc=conf.use_ipc,
-            rank=self.rank,
-            use_cuda=self.use_cuda
+            use_cuda=conf.on_cuda,
         )
 
         # define auxilary functions.
         self.helper_thread = None
         self.sync_buffer = {}
         self.n_bits = 0
-        self.it = 0
 
     def init_neighbor_hat_params(self):
         params, self.shapes = comm.get_data(
@@ -104,231 +112,119 @@ class SPARQ_SGD(Optimizer):
         }
 
     def __setstate__(self, state):
-        super(SPARQ_SGD, self).__setstate__(state)
+        super(TiCoPD, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
-
     
-    def step(self, closure=None, **kwargs):
-        lr = kwargs["scheduler"].get_lr()
-        self.lr = lr if not lr is None else self.lr
-        self.c = self.c_init + self.conf.epoch_ // 10 * self.c_incre # as mentioned in the paper: initialized to 2.0 and increases by 1.0 after every 10 epochs
-        # Apply the gradients with the weight decay and momentum.
-        utils.apply_gradient(
-            self.param_groups, self.state, apply_grad_to_model=True
-        )
 
-        # recover current params and hat_params
+    def get_lambda(self, param_groups, param_names):
+        data = []
+        for idx, _ in param_names:
+            _data = param_groups[idx]["lambdas"][0]
+            if _data is not None:
+                data.append(_data)
+        flatten_lambda = TensorBuffer(data, self.use_cuda)
+        return data, flatten_lambda
+    
+    def get_prm(self, param_groups, param_names):
+        data = []
+        for idx, _ in param_names:
+            _data = param_groups[idx]["params"][0]
+            if _data is not None:
+                data.append(_data)
+        flatten_params = TensorBuffer(data, self.use_cuda)
+        return data, flatten_params
+    
+    def get_zeros_prm_buffer(self, param_groups, param_names):
+        _, flatten_params = self.get_prm(param_groups, param_names)
+        flatten_params.buffer = torch.zeros_like(flatten_params.buffer)
+        return flatten_params
+
+
+    def step(self, closure=None, **kargs):
+        lr = kargs["scheduler"].get_lr()
+        self.lr = lr if not lr is None else self.lr
+        # start compress/sync.
         params, flatten_params, flatten_hat_params = utils.recover_params(
             param_groups=self.param_groups,
             param_names=self.param_names,
             rank=self.rank,
             neighbor_hat_params=self.neighbor_hat_params,
             get_hat_params=True,
-            use_cuda=self.use_cuda
         )
-
-        # check event 
-        hat_error = torch.norm(flatten_params.buffer - self.neighbor_hat_params[self.rank].buffer, p="fro")**2
-        active = hat_error > self.c * self.lr**2
-
-        # start compress/sync.
+        
         self.sync_buffer = {
             "original_shapes": self.shapes,
             "flatten_params": flatten_params,
             "flatten_hat_params": flatten_hat_params,
             "edge_result": {},
-            "n_bits": 0,
-            "active": active,
         }
 
-        # communicate the compressed hat variables.
         self.helper_thread = utils.HelperThread(
             name=f"_thread_at_epoch_{self.conf.epoch_}.compress",
             func=self.compressor.pipeline,
             # the arguments below will be feeded into the `func`.
             sync_buffer=self.sync_buffer,
+            neighbor_hat_params=self.neighbor_hat_params,
             neighbors_info=self.neighbors_info,
         )
         self.helper_thread.start()
         utils.join_thread(self.helper_thread)
 
-
-        # update neighbor_hat_params[self.rank]
-        if active:
-            q_values, q_indices = self.sync_buffer["edge_result"][self.rank]
-            self.neighbor_hat_params[self.rank].buffer[q_indices] += q_values
-        
-        # update neighbor_hat_params[nei]
-        for nei in self.compressor.active_neighbors:
-            q_values, q_indices = self.sync_buffer["edge_result"][nei]
-            weight = self.neighbors_info[nei]
-            self.neighbor_hat_params["memory"].buffer[q_indices] += weight * q_values
-
-        # get updated flatten params.
-        flatten_params.buffer += self.consensus_stepsize * (
-            self.neighbor_hat_params["memory"].buffer - self.neighbor_hat_params[self.rank].buffer
-        )
-       
-        # update the local model.
+        # ====== primal update ======
+        params, flatten_params = self.get_prm(self.param_groups, self.param_names)
+        flatten_params.buffer = self.beta * flatten_params.buffer + (1-self.beta) * self.neighbor_hat_params[self.rank].buffer
         flatten_params.unpack(params)
+
+        # Apply the gradients with the weight decay and momentum.
+        utils.apply_gradient(
+            self.param_groups, self.state, apply_grad_to_model=True
+        )
+
+        primal_update_vec = self.get_zeros_prm_buffer(self.param_groups, self.param_names)
+        primal_update_vec.buffer += self.theta * self.neighbor_hat_params["memory"].buffer
+
+        _lambda, flatten_lambda = self.get_lambda(self.param_groups, self.param_names)
+        primal_update_vec.buffer += flatten_lambda.buffer
+
+        params, flatten_params = self.get_prm(self.param_groups, self.param_names)
+        flatten_params.buffer -= self.lr * primal_update_vec.buffer
+        flatten_params.unpack(params)
+        # ====== end primal update ======
+
+
+        # ====== dual update ======
+        flatten_lambda.buffer += self.eta * self.neighbor_hat_params["memory"].buffer
+        flatten_lambda.unpack(_lambda)
+        # ====== end dual update ======
+
+
+        # ====== hat update ======
+        avg_comp_agg = self.get_zeros_prm_buffer(self.param_groups, self.param_names)
+
+        for rank in self.sync_buffer["edge_result"]:
+            if "top_k" in self.conf.comm_op or "random_k" in self.conf.comm_op:
+                idx, vals = self.sync_buffer["edge_result"][rank]
+                avg_comp_agg.buffer[idx] += self.neighbors_info[rank] * vals
+            elif "quantize" in self.conf.comm_op:
+                vals = self.sync_buffer["edge_result"][rank]
+                avg_comp_agg.buffer += self.neighbors_info[rank] * vals
         
-        self.it += 1
-        self.n_bits = self.sync_buffer["n_bits"]
+        self.neighbor_hat_params["memory"].buffer += avg_comp_agg.buffer
+
+        if "top_k" in self.conf.comm_op or "random_k" in self.conf.comm_op:
+            idx, vals = self.sync_buffer["edge_result"][self.rank]
+            self.neighbor_hat_params[self.rank].buffer[idx] += vals
+        elif "quantize" in self.conf.comm_op:
+            vals = self.sync_buffer["edge_result"][self.rank]
+            self.neighbor_hat_params[self.rank].buffer += vals
+        
+        # ====== end hat update ======
+
+        self.n_bits = self.sync_buffer.get("n_bits", 0)
+
         return self.n_bits
 
-
-class RandomGraphCompressor(object):
-    def __init__(
-        self,
-        aggregator,
-        comm_device,
-        compress_ratio,
-        is_biased,
-        backend,
-        use_ipc,
-        use_cuda,
-        **kargs,
-    ):
-        # assign the common hyper-parameters
-        self.aggregator_fn = aggregator
-        self.comm_device = comm_device
-        self.compress_ratio = compress_ratio
-        self.is_biased = is_biased
-        self.backend = backend
-        self.use_ipc = use_ipc
-        self.use_cuda = use_cuda
-        self.kargs = kargs
-        self.compressor_fn = SparsificationCompressor()
-
-        # define gossip_stream
-        if torch.cuda.is_available():
-            self.gossip_stream = torch.cuda.current_stream()
-            self.use_cuda = True
-
-    def pipeline(self, sync_buffer, neighbors_info):
-        if torch.cuda.is_available():
-            with torch.cuda.stream(self.gossip_stream):
-                try:
-                    self.compress(sync_buffer, neighbors_info)
-                    self.sync(sync_buffer)
-                    self.uncompress(sync_buffer)
-                except RuntimeError as e:
-                    print("Error: {}".format(e))
-        else:
-            self.compress(sync_buffer, neighbors_info)
-            self.sync(sync_buffer)
-            self.uncompress(sync_buffer)
-    
-
-    def prepare_compress(self, sync_buffer):
-        selected_values, selected_indices = [], []
-
-        for half_param, hat_param in zip(sync_buffer["flatten_params"], sync_buffer["flatten_hat_params"]):
-            _selected_values, _selected_indices = self.compressor_fn.get_random_k(
-                half_param - hat_param,
-                self.compress_ratio,
-                self.is_biased,
-            )
-            selected_values.append(_selected_values)
-            selected_indices.append(_selected_indices)
-
-        return selected_values, selected_indices
-
-
-
-    def compress(self, sync_buffer, neighbors_info):
-        self.active = sync_buffer["active"]
-        if self.active:
-            self.masked_values, self.masks = self.prepare_compress(sync_buffer)
-
-        if self.active:
-            selected_shapes = [len(_value) for _value in self.masked_values]
-
-            flatten_selected_values = TensorBuffer(self.masked_values, self.use_cuda)
-            flatten_selected_indices = TensorBuffer(self.masks, self.use_cuda)
-            if self.comm_device == "cpu":
-                send_message = [flatten_selected_values.buffer.cpu().pin_memory(), flatten_selected_indices.buffer.cpu().pin_memory()]
-            else:
-                send_message = [flatten_selected_values.buffer, flatten_selected_indices.buffer]
-
-        sync_buffer["send_dict"] = {}
-        if self.active:
-            for nei in neighbors_info:
-
-                sync_buffer["send_dict"][nei] = send_message
-
-                # get n_bits to transmit.
-                n_bits = get_n_bits(flatten_selected_values.buffer) + get_n_bits(
-                    flatten_selected_indices.buffer
-                )
-                sync_buffer["n_bits"] += n_bits
-
-
-        # check if neighbors are active
-        if self.active:
-            send_dict = {nei: torch.tensor([int(self.active), send_message[0].shape[0], *selected_shapes], dtype=torch.int64) for nei in neighbors_info}
-        else:
-            send_dict = {nei: torch.zeros(2 + len(sync_buffer["flatten_params"]), dtype=torch.int64) for nei in neighbors_info}
-        recv_dict = {nei: torch.zeros(2 + len(sync_buffer["flatten_params"]), dtype=torch.int64) for nei in neighbors_info}
-        _, recv_dict = self.aggregator_fn.one_way_sendrecv(send_dict, recv_dict, force_wait=True)
-        self.active_neighbors = {nei: msg[1] for nei, msg in recv_dict.items() if msg[0].item() == 1}
-        sync_buffer["selected_shapes"] = {nei: msg[2:] for nei, msg in recv_dict.items() if msg[0].item() == 1}
-
-
-    def sync(self, sync_buffer):
-        # sync.
-        sync_buffer["recv_dict"] = {}
-        for rank in self.active_neighbors:
-            recv_len = self.active_neighbors[rank]
-            sync_buffer["recv_dict"][rank] = [torch.empty(recv_len, dtype=torch.float32), torch.empty(recv_len, dtype=torch.int64)]
-
-        sync_message_reqs, synced_message = self.aggregator_fn.one_way_sendrecv_with_tags(sync_buffer["send_dict"], sync_buffer["recv_dict"], 
-                        force_wait=False)
-       
-        # update sync_buffer.
-        sync_buffer["sync_reqs"] = sync_message_reqs
-        sync_buffer["synced_message"] = synced_message
-
-    def uncompress(self, sync_buffer):
-        # wait the sync.
-        self.aggregator_fn.complete_wait(sync_buffer["sync_reqs"])
-
-        # uncompress and update.
-        for rank in self.active_neighbors:
-            # recover values/indices to the correct device.
-            q_values, q_indices = self._uncompress_helper(
-                sync_buffer["flatten_params"].buffer.device,
-                rank,
-                sync_buffer["synced_message"],
-                sync_buffer["selected_shapes"],
-                sync_buffer["original_shapes"],
-            )
-
-            # have (rank)-neighbour sparse param here
-            sync_buffer["edge_result"][rank] = (q_values, q_indices) # can be used directly on buffer
-            
-    def _uncompress_helper(
-        self,
-        _device,
-        _rank,
-        synced_message,
-        selected_shapes,
-        original_shapes,
-    ):
-        # recover the message and the corresponding device.
-        values = comm.recover_device(
-            synced_message[_rank][0], device=_device
-        )
-        indices = comm.recover_device(
-            synced_message[_rank][1], device=_device
-        )
-
-        # deal with unbalanced values/indieces
-        q_values, q_indices = self.compressor_fn.uncompress(
-            values, indices, selected_shapes[_rank], original_shapes
-        )
-        return q_values, q_indices
 
 """the entry for CHOCOCompressor."""
 
@@ -372,6 +268,7 @@ class CHOCOSparsificationCompressor(object):
         is_biased,
         backend,
         use_ipc,
+        use_cuda,
         **kargs,
     ):
         # assign the common hyper-parameters
@@ -383,15 +280,14 @@ class CHOCOSparsificationCompressor(object):
         self.is_biased = is_biased
         self.backend = backend
         self.use_ipc = use_ipc
+        self.use_cuda = use_cuda
         self.kargs = kargs
         self.compressor_fn = SparsificationCompressor()
 
         # define gossip_stream
         if torch.cuda.is_available():
-            if self.comm_device == "cpu":
-                self.gossip_stream = torch.cuda.current_stream()
-            else:
-                self.gossip_stream = torch.cuda.current_stream()
+            self.gossip_stream = torch.cuda.current_stream()
+            self.use_cuda = True
 
     def pipeline(self, sync_buffer, neighbor_hat_params, neighbors_info):
         if torch.cuda.is_available():
@@ -407,6 +303,7 @@ class CHOCOSparsificationCompressor(object):
             self.sync(sync_buffer)
             self.uncompress(sync_buffer, neighbor_hat_params, neighbors_info)
 
+
     def compress(self, sync_buffer):
         selected_values, selected_indices = [], []
 
@@ -421,12 +318,13 @@ class CHOCOSparsificationCompressor(object):
             )
             selected_values.append(_selected_values)
             selected_indices.append(_selected_indices)
+
         # get selected shapes.
         selected_shapes = [len(_value) for _value in selected_values]
 
         # flatten selected values/indices.
-        flatten_selected_values = TensorBuffer(selected_values)
-        flatten_selected_indices = TensorBuffer(selected_indices)
+        flatten_selected_values = TensorBuffer(selected_values, self.use_cuda)
+        flatten_selected_indices = TensorBuffer(selected_indices, self.use_cuda)
 
         # get n_bits to transmit.
         n_bits = get_n_bits(flatten_selected_values.buffer) + get_n_bits(
@@ -472,7 +370,7 @@ class CHOCOSparsificationCompressor(object):
             hat_params = neighbor_hat_params[
                 rank if rank in neighbor_hat_params else "memory"
             ]
-            hat_params_memory = neighbor_hat_params["memory"]
+            # hat_params_memory = neighbor_hat_params["memory"]
 
             # recover values/indices to the correct device.
             q_values, q_indices = self._uncompress_helper(
@@ -484,10 +382,12 @@ class CHOCOSparsificationCompressor(object):
                 sync_buffer["original_shapes"],
             )
 
+            sync_buffer["edge_result"][rank] = (q_indices, q_values)
+
             # update neighbor_hat_params
-            if rank in neighbor_hat_params:
-                hat_params.buffer[q_indices] += q_values
-            hat_params_memory.buffer[q_indices] += weight * q_values
+            # if rank in neighbor_hat_params:
+            #     hat_params.buffer[q_indices] += q_values
+            # hat_params_memory.buffer[q_indices] += weight * q_values
 
     def _uncompress_helper(
         self,
@@ -512,6 +412,24 @@ class CHOCOSparsificationCompressor(object):
         return q_values, q_indices
 
 
+class BiasedQuantizer(object):
+    def quantize(self, x, b):
+        norm = torch.norm(x)
+        delta = sqrt(x.shape[0]) / (2 **(b - 1))
+        xi = 1 + delta if delta > 1 else 1 + delta ** 2
+        tmp = (2 ** (b - 1)) / norm * torch.abs(x) + torch.randn(x.shape, device=x.device)
+        return torch.sign(x) * torch.floor(tmp) * (norm / (2 ** (b - 1)) / xi)
+    
+    def compress(self, arr, op, quantize_level, is_biased):
+        if quantize_level != 32:
+            values = self.quantize(arr, quantize_level)
+        else:
+            values = arr
+        return values
+
+    def uncompress(self, arr):
+        return arr
+
 class CHOCOQuantizationCompressor(object):
     def __init__(
         self,
@@ -523,6 +441,7 @@ class CHOCOQuantizationCompressor(object):
         is_biased,
         backend,
         use_ipc,
+        use_cuda,
         **kargs,
     ):
         # assign the common hyper-parameters
@@ -534,15 +453,14 @@ class CHOCOQuantizationCompressor(object):
         self.is_biased = is_biased
         self.backend = backend
         self.use_ipc = use_ipc
+        self.use_cuda = use_cuda
         self.kargs = kargs
         self.compressor_fn = QuantizationCompressor()
 
         # define gossip_stream
         if torch.cuda.is_available():
-            if self.comm_device == "cpu":
-                self.gossip_stream = torch.cuda.current_stream()
-            else:
-                self.gossip_stream = torch.cuda.current_stream()
+            self.gossip_stream = torch.cuda.current_stream()
+            self.use_cuda = True
 
     def pipeline(self, sync_buffer, neighbor_hat_params, neighbors_info):
         if torch.cuda.is_available():
@@ -573,10 +491,10 @@ class CHOCOQuantizationCompressor(object):
             quantized_values.append(_quantized_values)
 
         # flatten selected values/indices.
-        flatten_updates = TensorBuffer(quantized_values)
+        flatten_updates = TensorBuffer(quantized_values, self.use_cuda)
 
         # get n_bits to transmit.
-        n_bits = get_n_bits(flatten_updates.buffer) * self.quantize_level / 64
+        n_bits = get_n_bits(flatten_updates.buffer) * self.quantize_level / 32
 
         # update shared dict.
         sync_buffer["flatten_updates"] = flatten_updates
@@ -606,17 +524,20 @@ class CHOCOQuantizationCompressor(object):
             hat_params = neighbor_hat_params[
                 rank if rank in neighbor_hat_params else "memory"
             ]
-            hat_params_memory = neighbor_hat_params["memory"]
+            # hat_params_memory = neighbor_hat_params["memory"]
 
             # recover correct values/indices.
             q_values = comm.recover_device(
                 sync_buffer["synced_message"][rank], device=hat_params.buffer.device
             )
 
+            sync_buffer["edge_result"][rank] = q_values
+
+
             # update neighbor_hat_params
-            if rank in neighbor_hat_params:
-                hat_params.buffer += q_values
-            hat_params_memory.buffer += weight * q_values
+            # if rank in neighbor_hat_params:
+            #     hat_params.buffer += q_values
+            # hat_params_memory.buffer += weight * q_values
 
 
 class CHOCOSignCompressor(object):
@@ -630,6 +551,7 @@ class CHOCOSignCompressor(object):
         is_biased,
         backend,
         use_ipc,
+        use_cuda,
         **kargs,
     ):
         # assign the common hyper-parameters
@@ -641,23 +563,28 @@ class CHOCOSignCompressor(object):
         self.is_biased = is_biased
         self.backend = backend
         self.use_ipc = use_ipc
+        self.use_cuda = use_cuda
         self.kargs = kargs
         self.compressor_fn = SignCompressor()
 
         # define gossip_stream
-        if self.comm_device == "cpu":
+        if torch.cuda.is_available():
             self.gossip_stream = torch.cuda.current_stream()
-        else:
-            self.gossip_stream = torch.cuda.current_stream()
+            self.use_cuda = True
 
     def pipeline(self, sync_buffer, neighbor_hat_params, neighbors_info):
-        with torch.cuda.stream(self.gossip_stream):
-            try:
-                self.compress(sync_buffer)
-                self.sync(sync_buffer)
-                self.uncompress(sync_buffer, neighbor_hat_params, neighbors_info)
-            except RuntimeError as e:
-                print("Error: {}".format(e))
+        if torch.cuda.is_available():
+            with torch.cuda.stream(self.gossip_stream):
+                try:
+                    self.compress(sync_buffer)
+                    self.sync(sync_buffer)
+                    self.uncompress(sync_buffer, neighbor_hat_params, neighbors_info)
+                except RuntimeError as e:
+                    print("Error: {}".format(e))
+        else:
+            self.compress(sync_buffer)
+            self.sync(sync_buffer)
+            self.uncompress(sync_buffer, neighbor_hat_params, neighbors_info)
 
     def compress(self, sync_buffer):
         # get the sign/magnitude for the tensor (to be transmitted).
@@ -670,8 +597,8 @@ class CHOCOSignCompressor(object):
             norms += [_update.norm(p=1)]
 
         # flatten selected values/indices.
-        flatten_norms = TensorBuffer(norms)
-        flatten_directions = TensorBuffer(updates)
+        flatten_norms = TensorBuffer(norms, self.use_cuda)
+        flatten_directions = TensorBuffer(updates, self.use_cuda)
         signs, sign_size = self.compressor_fn.compress(flatten_directions.buffer)
 
         # get n_bits to transmit.

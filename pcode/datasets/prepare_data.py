@@ -288,11 +288,34 @@ def get_tomshardware_dataset(rank, world_size, seed, train_size=1000):
     test_loader = DataLoader(Simple_dataset(datasource.test_x, datasource.test_y),  batch_size=datasource.test_x.shape[0], shuffle=False)
     return train_loader, test_loader
 
+def generate_synthetic_dataset(rank, world_size, batch_size, dim=1000, train_samples=1000, n_class=10):
+    samples_per_agent = train_samples // world_size
+#     hetero_var = 1
+    feature_var = 0.1
+    noise_var = 0.1
     
+    feature_width = world_size / 2
+    agent_mean = np.random.uniform((-feature_width + rank)/feature_width, (-feature_width + rank+1 )/feature_width, size=dim)
+    
+    np.random.seed(0)
+    # same ground truth
+    x_truth = np.random.uniform(-1, 1, size=(n_class, dim))
+    
+    agent_obs = np.random.normal(agent_mean, np.sqrt(0.05), size=(samples_per_agent, dim))
+    agent_test_obs = np.random.normal(agent_mean, np.sqrt(0.05), size=(samples_per_agent, dim))
+
+    label = np.argmax(agent_obs @ x_truth.T, axis=-1) # \in [n_class]
+    test_label = np.argmax(agent_test_obs @ x_truth.T, axis=-1) # \in [n_class]
+
+    train_loader = DataLoader(Simple_dataset(agent_obs, label),  batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(Simple_dataset(agent_test_obs, test_label),  batch_size=batch_size, shuffle=False)
+    return {"train_loader": train_loader, "val_loader": val_loader}
+
+
 class Simple_dataset(Dataset):
     def __init__(self, x, y):
-        self._data = torch.tensor(x, dtype=torch.double)
-        self._label = torch.tensor(y, dtype=torch.double)
+        self._data = torch.tensor(x, dtype=torch.float32)
+        self._label = torch.tensor(y)
     
     def __getitem__(self, idx):
         return self._data[idx], self._label[idx]
@@ -312,17 +335,13 @@ class RegressionData():
                                             "/home/user/TomsHardware/TomsHardware_normalized_train.data", 
                                             "/home/user/TomsHardware/TomsHardware_normalized_test.data", 
                                             "tomshardware") # https://archive.ics.uci.edu/ml/datasets/Buzz+in+social+media+
-#         self.df, self.name = "/home/cyyau/project/regression/insurance.csv", "krr-insurance"
-#         self.df, self.name = ("/home/cyyau/project/regression/airfoil_self_noise.csv", 
-#                               "/home/cyyau/project/regression/airfoil_self_noise_normalized.csv",
-#                               "krr-airfoil") # https://archive.ics.uci.edu/ml/datasets/airfoil+self-noise
         if not isfile(self.df_train):
             if split_id is None or split_id == 0:
                 print("preprocessing dataset, storing to {} and {}".format(self.df_train, self.df_test))
                 self.__preprocessor()
                 exit()
             else:
-                raise ValueError("unprocessed data, waiting to handle normalization and splitting")
+                raise ValueError("unp.randomocessed data, waiting to handle normalization and splitting")
         
         self.train = np.genfromtxt(self.df_train, delimiter=',', dtype=np.double)
         self.test = np.genfromtxt(self.df_test, delimiter=',', dtype=np.double)

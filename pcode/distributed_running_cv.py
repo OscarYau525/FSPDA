@@ -68,6 +68,12 @@ def train_and_validate(
         sam_optimizer = SAM(model.parameters(), optimizer)
     else:
         sam_optimizer = None
+    
+    if optimizer.__class__.__name__ in ["K_GT", "LED"]:
+        # configure the eval timepoints of K_GT / LED only at (it-1) % local_steps == 0.
+        assert not scheduler.log_eval, "missing implementation for K_GT with log_eval."
+        total_iterations = conf.num_iterations // optimizer.local_steps
+        scheduler.eval_timepoints = [int(i * total_iterations // scheduler.eval_n_points) * optimizer.local_steps for i in range(0, scheduler.eval_n_points+1)]
 
     if optimizer.__class__.__name__ == "GtHsgd" or "DoCoM" in optimizer.__class__.__name__ or "BEER" in optimizer.__class__.__name__:
         # First step of GT-HSGD / DoCoM
@@ -89,9 +95,90 @@ def train_and_validate(
     total_bits_transmitted = 0
     dist.barrier()
     while True:
-
         # configure local step.
         for _input, _target in data_loader["train_loader"]:
+            if scheduler.is_eval():
+                dist.barrier()
+                # evaluate gradient tracker consensus
+                # if optimizer.__class__.__name__ in ["GNSD", "GtHsgd", "DeTAG", "ParallelDoCoM_V", "ParallelBEER_V"]:
+                #     local_gt = optimizer.get_gt()
+                #     avged_gt = global_tensor_average(local_gt, conf.graph.n_nodes, conf.on_cuda)
+                #     log_gt_diff(conf, scheduler, local_gt, avged_gt)
+                
+                # refresh the logging cache at the begining of each epoch.
+                tracker_tr.reset()
+
+                # evaluate (and only inference) on the whole training loader.
+                if not conf.train_fast and not conf.skip_eval:
+
+                    # evaluate on the local model.
+                    if not conf.eval_consensus_only or (conf.eval_consensus_only and scheduler.is_stop()):
+                        stats = {}
+
+                        stats["iteration"] = torch.tensor(scheduler.local_index, dtype=torch.int64)
+                        it_agg = torch.tensor(stats["iteration"])
+                        dist.reduce(it_agg, dst=0, op=dist.ReduceOp.MAX)
+                        stats["iteration"] = it_agg.item()
+
+                        stats["bits_transmitted"] = total_bits_transmitted
+                        bits_agg = torch.tensor(stats["bits_transmitted"])
+                        dist.reduce(bits_agg, dst=0, op=dist.ReduceOp.SUM)
+                        stats["bits_transmitted"] = bits_agg.item()
+
+                        if conf.eval_worst:
+                            worst_stats = all_gather_models_and_local_eval_and_cal_consensus(
+                                conf,
+                                model,
+                                optimizer,
+                                criterion,
+                                scheduler,
+                                metrics,
+                                data_loader=data_loader,
+                                global_models=global_models
+                            )
+                            worst_stats = aggregate_stats(worst_stats)
+                            stats = {**stats, **worst_stats}
+                        if conf.eval_avg:
+                            avg_stats = all_reduce_models_and_global_eval_and_cal_consensus(
+                                conf,
+                                model,
+                                optimizer,
+                                criterion,
+                                scheduler,
+                                metrics,
+                                data_loader
+                            )
+                            stats = {**stats, **avg_stats}
+                            
+                        if "FSP" in  optimizer.__class__.__name__:
+                            msg = {"eta": optimizer.eta, "gamma": optimizer.gamma, "beta": optimizer.beta}
+                            stats = {**stats, **msg}
+                        # if "STORM" in optimizer.__class__.__name__:
+                        #     msg = {"storm_primal_lr_node0": optimizer.storm_lr1, "storm_dual_lr_node0": optimizer.storm_lr2}
+                        #     stats = {**stats, **msg}
+                        if scheduler.local_index > 0:
+                            stats = {**stats, "lr": optimizer.lr}
+                        if conf.graph.rank == 0:
+                            wandb.log(stats)
+                    else:
+                        consensus_distance(conf, model, optimizer, scheduler)
+
+                # determine if the training is finished.
+                if scheduler.is_stop():
+                    # save json.
+                    conf.logger.save_json()
+                    # save the model.
+                    if conf.save_model:
+                        save_local_model(
+                            {"state_dict": model.state_dict()},
+                            conf.model_dir, 
+                            "local_model_{}.pth".format(conf.graph.rank)
+                        )
+                    # temporarily hack the exit parallelchoco
+                    if optimizer.__class__.__name__ == "ParallelCHOCO" or optimizer.__class__.__name__ == "ParallelDoCoM":
+                        error_handler.abort()
+                    return
+            
             model.train()
             scheduler.step(optimizer, const_stepsize=conf.const_lr)
 
@@ -121,9 +208,10 @@ def train_and_validate(
 
             # display the logging info.
             msg = {}
-            if "FSP" in  optimizer.__class__.__name__:
-                msg = {"eta": optimizer.eta, "gamma": optimizer.gamma / 2, "beta": optimizer.beta}
-            display_training_stat(conf, scheduler, tracker_tr, n_bits_to_transmit, display=conf.graph.rank==0, extra_stats=msg)
+            if scheduler.local_index % conf.summary_freq == 0:
+                if "FSP" in  optimizer.__class__.__name__:
+                    msg = {"eta": optimizer.eta, "gamma": optimizer.gamma / 2, "beta": optimizer.beta}
+                display_training_stat(conf, scheduler, tracker_tr, n_bits_to_transmit, display=conf.graph.rank==0, extra_stats=msg)
 
             # display tracking time.
             if (
@@ -142,72 +230,7 @@ def train_and_validate(
             if scheduler.epoch_ % 1 == 0:
                 tracker_tr.reset()
             
-            if scheduler.is_eval():
-                dist.barrier()
-                # evaluate gradient tracker consensus
-                if optimizer.__class__.__name__ in ["GNSD", "GtHsgd", "DeTAG", "ParallelDoCoM_V", "ParallelBEER_V"]:
-                    local_gt = optimizer.get_gt()
-                    avged_gt = global_tensor_average(local_gt, conf.graph.n_nodes, conf.on_cuda)
-                    log_gt_diff(conf, scheduler, local_gt, avged_gt)
-                
-                # refresh the logging cache at the begining of each epoch.
-                tracker_tr.reset()
-
-                # evaluate (and only inference) on the whole training loader.
-                if not conf.train_fast and not conf.skip_eval:
-
-                    # evaluate on the local model.
-                    if not conf.eval_consensus_only or (conf.eval_consensus_only and scheduler.is_stop()):
-                        if conf.eval_worst:
-                            _stats = all_gather_models_and_local_eval_and_cal_consensus(
-                                conf,
-                                model,
-                                optimizer,
-                                criterion,
-                                scheduler,
-                                metrics,
-                                data_loader=data_loader,
-                                global_models=global_models
-                            )
-                            _stats["bits_transmitted"] = total_bits_transmitted
-                            _stats["iteration"] = torch.tensor(scheduler.local_index, dtype=torch.int64)
-                            _stats = aggregate_stats(_stats)
-                        else:
-                            _stats = all_reduce_models_and_global_eval_and_cal_consensus(
-                                conf,
-                                model,
-                                optimizer,
-                                criterion,
-                                scheduler,
-                                metrics,
-                                data_loader
-                            )
-                            _stats["bits_transmitted"] = total_bits_transmitted
-                            _stats["iteration"] = torch.tensor(scheduler.local_index, dtype=torch.int64)
-                        if "FSP" in  optimizer.__class__.__name__:
-                            msg = {"eta": optimizer.eta, "gamma": optimizer.gamma / 2, "beta": optimizer.beta}
-                            _stats = {**_stats, **msg}
-                        _stats = {**_stats, "lr": optimizer.lr}
-                        if conf.graph.rank == 0:
-                            wandb.log(_stats)
-                    else:
-                        consensus_distance(conf, model, optimizer, scheduler)
-
-                # determine if the training is finished.
-                if scheduler.is_stop():
-                    # save json.
-                    conf.logger.save_json()
-                    # save the model.
-                    if conf.save_model:
-                        save_local_model(
-                            {"state_dict": model.state_dict()},
-                            conf.model_dir, 
-                            "local_model_{}.pth".format(conf.graph.rank)
-                        )
-                    # temporarily hack the exit parallelchoco
-                    if optimizer.__class__.__name__ == "ParallelCHOCO" or optimizer.__class__.__name__ == "ParallelDoCoM":
-                        error_handler.abort()
-                    return
+            
 
             
 
@@ -349,15 +372,15 @@ def all_reduce_models_and_global_eval_and_cal_consensus(
     test_stat = _eval_wrapper(conf, scheduler, avg_model, label_val, True)
 
     result_dict = {
-        "train_top1": train_stat["top1"],
-        "train_loss": train_stat["loss"],
-        "test_top1": test_stat["top1"],
-        "test_loss": test_stat["loss"],
+        "avg_train_top1": train_stat["top1"],
+        "avg_train_loss": train_stat["loss"],
+        "avg_test_top1": test_stat["top1"],
+        "avg_test_loss": test_stat["loss"],
         "consensus_error": consensus_dist
     }
     if conf.eval_grad:
-        result_dict["train_grad_norm"] = train_stat["grad_norm"]
-        result_dict["test_grad_norm"] = test_stat["grad_norm"]
+        result_dict["avg_train_grad_norm"] = train_stat["grad_norm"]
+        result_dict["avg_test_grad_norm"] = test_stat["grad_norm"]
 
     del avg_model
     
@@ -524,13 +547,13 @@ def all_gather_models_and_local_eval_and_cal_consensus(
     test_stat = _eval_wrapper(conf, scheduler, global_models, label_val, True)
 
     result_dict = {
-        "train_top1": train_stat["top1"],
-        "train_loss": train_stat["loss"],
-        "test_top1": test_stat["top1"],
-        "test_loss": test_stat["loss"],
+        "worst_train_top1": train_stat["top1"],
+        "worst_train_loss": train_stat["loss"],
+        "worst_test_top1": test_stat["top1"],
+        "worst_test_loss": test_stat["loss"],
         "consensus_error": consensus_dist
     }
     if conf.eval_grad:
-        result_dict["train_grad_norm"] = train_stat["grad_norm"]
-        result_dict["test_grad_norm"] = test_stat["grad_norm"]
+        result_dict["worst_train_grad_norm"] = train_stat["grad_norm"]
+        result_dict["worst_test_grad_norm"] = test_stat["grad_norm"]
     return result_dict

@@ -65,7 +65,7 @@ class Di_CS_GT(Optimizer):
         self.use_cuda = conf.on_cuda
         self.gamma = conf.gamma
         self.B = conf.B_connected
-        self.edge_fraction = conf.edge_fraction
+        self.edge_prob = conf.edge_prob
         self.B_round_active_neighbours = set()
         self.it = 0
 
@@ -107,7 +107,7 @@ class Di_CS_GT(Optimizer):
             one_edge=conf.one_edge,
             use_ipc=conf.use_ipc,
             use_cuda=self.use_cuda,
-            edge_fraction=self.edge_fraction,
+            edge_prob=self.edge_prob,
             world_size=self.world_size,
         )
 
@@ -353,7 +353,7 @@ class Di_CS_DirectedGraph_Sparsifier(object):
             edge_activation = {nei: torch.rand(1) for nei in self.aggregator_fn.neighbor_ranks}
             edge_activation = self.aggregator_fn.one_way_consensus(edge_activation, force_wait=True)
 
-            active_neighbors = [nei for nei in edge_activation if edge_activation[nei] <= self.kargs["edge_fraction"]]
+            active_neighbors = [nei for nei in edge_activation if edge_activation[nei] <= self.kargs["edge_prob"]]
             edge_masks = {nei: self.prepare_compress(flatten_params) for nei in active_neighbors}
         return active_neighbors, edge_masks
     

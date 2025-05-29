@@ -13,7 +13,7 @@ from pcode.utils.tensor_buffer import TensorBuffer
 import numpy as np
 import torch.distributed as dist
 
-class FSPDA(Optimizer): # current implementation uses local updates
+class FSPDA_Async(Optimizer): # current implementation uses local updates
     def __init__(
         self,
         params,
@@ -34,11 +34,10 @@ class FSPDA(Optimizer): # current implementation uses local updates
         )
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        super(FSPDA, self).__init__(params, defaults)
+        super(FSPDA_Async, self).__init__(params, defaults)
 
         # define the aggregator.
         self.rank = conf.graph.rank
-        self.world_size = conf.n_mpi_process
         torch.manual_seed(self.rank)
         np.random.seed(self.rank)
         self.neighbors_info = conf.graph.get_neighborhood()
@@ -68,14 +67,9 @@ class FSPDA(Optimizer): # current implementation uses local updates
 
         # store the whole training arguments.
         self.conf = conf
-        self.use_cuda = conf.on_cuda
         self.gamma = conf.gamma
         self.eta = conf.eta
-        self.eta_ratio = self.eta / conf.lr 
         self.beta = conf.beta
-
-        if self.conf.lr_change_epochs is not None:
-            self.lr_schedule = [ int(ep) for ep in self.conf.lr_change_epochs.split(",") ]
         
         # define param names and init model_hat.
         self.param_names = list(
@@ -92,9 +86,6 @@ class FSPDA(Optimizer): # current implementation uses local updates
             use_ipc=conf.use_ipc,
             edge_prob=self.edge_prob,
             one_edge=conf.one_edge,
-            use_cuda=self.use_cuda,
-            world_size=self.world_size,
-            compression_noise=conf.compression_noise
         )
 
         # define auxilary functions.
@@ -110,7 +101,7 @@ class FSPDA(Optimizer): # current implementation uses local updates
     
     
     def __setstate__(self, state):
-        super(FSPDA, self).__setstate__(state)
+        super(FSPDA_Async, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
 
@@ -126,7 +117,7 @@ class FSPDA(Optimizer): # current implementation uses local updates
             _data = param_groups[idx]["lambdas"][0]
             if _data is not None:
                 data.append(_data)
-        flatten_lambda = TensorBuffer(data, self.use_cuda)
+        flatten_lambda = TensorBuffer(data)
         return data, flatten_lambda
     
     def get_prm(self, param_groups, param_names):
@@ -135,28 +126,19 @@ class FSPDA(Optimizer): # current implementation uses local updates
             _data = param_groups[idx]["params"][0]
             if _data is not None:
                 data.append(_data)
-        flatten_params = TensorBuffer(data, self.use_cuda)
+        flatten_params = TensorBuffer(data)
         return data, flatten_params
     
     def get_zeros_prm_buffer(self, param_groups, param_names):
         _, flatten_params = self.get_prm(param_groups, param_names)
         flatten_params.buffer = torch.zeros_like(flatten_params.buffer)
         return flatten_params
-
-    def update_eta(self):
-        if self.conf.lr_change_epochs is not None:
-            if len(self.lr_schedule) > 0 and self.conf.epoch_ >= self.lr_schedule[0]:
-                self.lr_schedule.pop(0)
-                self.eta /= self.conf.lr_decay
-                print("eta decay: eta = {}".format(self.eta))
     
     
     def step(self, **kwargs):
-        self.update_eta()
         self.n_bits = 0
         lr = kwargs["scheduler"].get_lr()
         self.lr = lr if not lr is None else self.lr
-        self.eta = self.lr * self.eta_ratio
         params, flatten_params = self.get_prm(self.param_groups, self.param_names)
             
         # draw new \xi
@@ -173,15 +155,13 @@ class FSPDA(Optimizer): # current implementation uses local updates
             "n_bits": 0
         }
 
-        # self.helper_thread = utils.HelperThread(
-        #     name=f"_thread_at_epoch_{self.conf.epoch_}.compress",
-        #     func=self.compressor.pipeline,
-        #     # the arguments below will be feeded into the `func`.
-        #     sync_buffer=self.sync_buffer,
-        # )
-        # self.helper_thread.start()
-
-        self.compressor.pipeline(self.sync_buffer)
+        self.helper_thread = utils.HelperThread(
+            name=f"_thread_at_epoch_{self.conf.epoch_}.compress",
+            func=self.compressor.pipeline,
+            # the arguments below will be feeded into the `func`.
+            sync_buffer=self.sync_buffer,
+        )
+        self.helper_thread.start()
         utils.join_thread(self.helper_thread)
         self.n_bits += self.sync_buffer.get("n_bits", 0)
         #  ==== end of aggregates, results stored in self.sync_buffer["edge_result"][nei] ==== 
@@ -191,13 +171,13 @@ class FSPDA(Optimizer): # current implementation uses local updates
         agg_buffer = self.get_zeros_prm_buffer(self.param_groups, self.param_names)
         for nei in self.sync_buffer["edge_result"]:
             sparse_values, indices = self.sync_buffer["edge_result"][nei]
-            agg_buffer.buffer[ indices ] -= self.gamma * (flatten_params.buffer[indices] - sparse_values)
+            agg_buffer.buffer[ indices ] -= self.gamma / 2 * (flatten_params.buffer[indices] - sparse_values)
         
         # end of sparse graph gossip
             
         _lambda, flatten_lambda = self.get_lambda(self.param_groups, self.param_names)
         agg_buffer.buffer -= self.eta * flatten_lambda.buffer
-        # end of applying dual variable 
+        # end of applying dual dual 
 
         # apply prm.grad + weight_decay to local model
         utils.apply_gradient(
@@ -235,9 +215,6 @@ class RandomGraph_Sparsifier(object):
         is_biased,
         backend,
         use_ipc,
-        use_cuda,
-        world_size,
-        compression_noise,
         **kargs,
     ):
         # assign the common hyper-parameters
@@ -247,16 +224,12 @@ class RandomGraph_Sparsifier(object):
         self.is_biased = is_biased
         self.backend = backend
         self.use_ipc = use_ipc
-        self.use_cuda = use_cuda
-        self.world_size = world_size
-        self.compression_noise = compression_noise
         self.kargs = kargs
         self.compressor_fn = SparsificationCompressor()
 
         # define gossip_stream
         if torch.cuda.is_available():
             self.gossip_stream = torch.cuda.current_stream()
-            self.use_cuda = True
 
     def pipeline(self, sync_buffer):
         if torch.cuda.is_available():
@@ -275,8 +248,8 @@ class RandomGraph_Sparsifier(object):
 
     def sample_random_graph(self, flatten_params, it):
         if self.kargs["one_edge"]:
-            # implemented 1 edge random graph, where initiator randomly selects one neighbor
-            initiator = int(it % self.world_size)
+            # implemented 1 edge random graph
+            initiator = int(it % self.aggregator_fn.world_size)
             if self.aggregator_fn.rank == initiator:
                 # I am initiator this round
                 rand_neigh_idx = int(np.floor(np.random.rand() * len(self.aggregator_fn.neighbor_ranks)))
@@ -349,29 +322,24 @@ class RandomGraph_Sparsifier(object):
             
             selected_shapes = [len(_value) for _value in selected_values]
 
-            flatten_selected_values = TensorBuffer(selected_values, self.use_cuda)
-            flatten_selected_indices = TensorBuffer(selected_indices, self.use_cuda)
+            flatten_selected_values = TensorBuffer(selected_values)
+            flatten_selected_indices = TensorBuffer(selected_indices)
 
-            noise = torch.zeros_like(flatten_selected_values.buffer).uniform_(-self.compression_noise, self.compression_noise)
-            flatten_selected_values.buffer += noise
-
-            sync_buffer["send_dict"][nei] = [flatten_selected_values.buffer, flatten_selected_indices.buffer]
+            sync_buffer["send_dict"][nei] = torch.cat(
+                [flatten_selected_values.buffer, 
+                flatten_selected_indices.buffer]
+            )
 
             sync_buffer["selected_shapes"][nei] = selected_shapes
             if self.comm_device == "cpu":
-                sync_buffer["send_dict"][nei][0] = sync_buffer["send_dict"][nei][0].cpu().pin_memory()
-                sync_buffer["send_dict"][nei][1] = sync_buffer["send_dict"][nei][1].cpu().pin_memory()
+                sync_buffer["send_dict"][nei] = sync_buffer["send_dict"][nei].cpu().pin_memory()
             
             # get n_bits to transmit.
-            if self.compress_ratio > 0:
-                if self.aggregator_fn.rank > nei:
-                    n_bits = get_n_bits(flatten_selected_values.buffer) + get_n_bits(
-                        flatten_selected_indices.buffer
-                    )
-                else:
-                    n_bits = get_n_bits(flatten_selected_values.buffer)
+            if self.aggregator_fn.rank > nei:
+                n_bits = get_n_bits(flatten_selected_values.buffer) + get_n_bits(
+                    flatten_selected_indices.buffer
+                )
             else:
-                # no sparsification is applied
                 n_bits = get_n_bits(flatten_selected_values.buffer)
             sync_buffer["n_bits"] += n_bits
 
@@ -379,14 +347,15 @@ class RandomGraph_Sparsifier(object):
         # sync.
         sync_buffer["recv_dict"] = {}
         for rank in sync_buffer["send_dict"]:
-            sync_buffer["recv_dict"][rank] = [torch.empty_like(sync_buffer["send_dict"][rank][0]), torch.empty_like(sync_buffer["send_dict"][rank][1])]
+            sync_buffer["recv_dict"][rank] = torch.empty_like(sync_buffer["send_dict"][rank])
 
-        sync_message_reqs, synced_message = self.aggregator_fn.two_way_sendrecv_with_tags(sync_buffer["send_dict"], sync_buffer["recv_dict"], 
+        sync_message_reqs, synced_message = self.aggregator_fn.two_way_sendrecv(sync_buffer["send_dict"], sync_buffer["recv_dict"], 
                         force_wait=False, active_neighbors=self.active_neighbors)
        
         # update sync_buffer.
         sync_buffer["sync_reqs"] = sync_message_reqs
         sync_buffer["synced_message"] = synced_message
+        sync_buffer["sycned_message_size"] = {nei: len(sync_buffer["send_dict"][nei]) for nei in sync_buffer["send_dict"]}
 
     def uncompress(self, sync_buffer):
         # wait the sync.
@@ -394,11 +363,15 @@ class RandomGraph_Sparsifier(object):
 
         # uncompress and update.
         for rank in self.active_neighbors:
+            # tmp_params_memory = neighbor_tmp_params["memory"]
+            message_size = int(sync_buffer["sycned_message_size"][rank] / 2)
+
             # recover values/indices to the correct device.
             q_values, q_indices = self._uncompress_helper(
                 sync_buffer["flatten_params"].buffer.device,
                 rank,
                 sync_buffer["synced_message"],
+                message_size,
                 sync_buffer["selected_shapes"],
                 sync_buffer["original_shapes"],
             )
@@ -411,16 +384,16 @@ class RandomGraph_Sparsifier(object):
         _device,
         _rank,
         synced_message,
+        sycned_message_size,
         selected_shapes,
         original_shapes,
     ):
         # recover the message and the corresponding device.
-        values = comm.recover_device(
-            synced_message[_rank][0], device=_device
+        _message = comm.recover_device(
+            synced_message[_rank], device=_device
         )
-        indices = comm.recover_device(
-            synced_message[_rank][1], device=_device
-        )
+        values = _message[:sycned_message_size]
+        indices = _message[sycned_message_size:]
 
         # deal with unbalanced values/indieces
         q_values, q_indices = self.compressor_fn.uncompress(

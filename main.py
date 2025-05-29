@@ -21,6 +21,7 @@ import pcode.utils.checkpoint as checkpoint
 import pcode.utils.op_paths as op_paths
 import pcode.utils.stat_tracker as stat_tracker
 import pcode.utils.logging as logging
+from pcode.utils.loss_fn import SigmoidLoss
 from pcode.utils.timer import Timer
 
 
@@ -147,7 +148,10 @@ def main(conf):
         from pcode.distributed_running_cv import train_and_validate
 
         # define the criterion and metrics.
-        criterion = nn.CrossEntropyLoss(reduction="mean")
+        if conf.loss == "sigmoid":
+            criterion = SigmoidLoss()
+        else:
+            criterion = nn.CrossEntropyLoss(reduction="mean")
         criterion = criterion.cuda() if conf.graph.on_cuda else criterion
         metrics = create_metrics.Metrics(
             model.module if "DataParallel" == model.__class__.__name__ else model,

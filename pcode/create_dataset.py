@@ -4,7 +4,7 @@ import torch
 # import torchtext
 
 from pcode.datasets.partition_data import DataPartitioner
-from pcode.datasets.prepare_data import get_dataset, get_tomshardware_dataset
+from pcode.datasets.prepare_data import get_dataset, get_tomshardware_dataset, generate_synthetic_dataset
 from pcode.utils.communication import global_average
 
 
@@ -18,6 +18,9 @@ def load_data_batch(conf, _input, _target):
 def define_dataset(conf, force_shuffle=False):
     if "rnn_lm" in conf.arch:
         dataset = define_nlp_dataset(conf, force_shuffle)
+    elif "synthetic_heterogeneous" == conf.data:
+        dataset = generate_synthetic_dataset(conf.rank, conf.n_mpi_process, conf.batch_size, conf.data_dim, conf.num_train_samples, conf.num_classes)
+        conf.num_batches_train_per_device_per_epoch = len(dataset["train_loader"])
     elif "femnist" == conf.data:
         dataset = define_femnist_dataset(conf, force_shuffle)
     elif "tomshardware" == conf.data:

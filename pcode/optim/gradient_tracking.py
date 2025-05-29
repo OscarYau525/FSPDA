@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from copy import deepcopy
 import torch
 from torch.optim.optimizer import Optimizer, required
 
@@ -13,7 +14,7 @@ from pcode.utils.tensor_buffer import TensorBuffer
 import numpy as np
 import torch.distributed as dist
 
-class FSPDA(Optimizer): # current implementation uses local updates
+class GT(Optimizer): # current implementation uses local updates
     def __init__(
         self,
         params,
@@ -34,7 +35,7 @@ class FSPDA(Optimizer): # current implementation uses local updates
         )
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        super(FSPDA, self).__init__(params, defaults)
+        super(GT, self).__init__(params, defaults)
 
         # define the aggregator.
         self.rank = conf.graph.rank
@@ -60,19 +61,23 @@ class FSPDA(Optimizer): # current implementation uses local updates
         self.edge_prob = conf.edge_prob
         self.it = 0
 
-        # initialize dual variable lambda
+        # initialize dual variable lambda and primal memory
         for groups in self.param_groups:
-            groups["lambdas"] = [torch.zeros_like(prm) for prm in groups["params"]]
+            groups["gt"] = [torch.zeros_like(prm) for prm in groups["params"]]
+            groups["prev_grad"] = [torch.zeros_like(prm) for prm in groups["params"]]
+
 
         self.model = model
+        self.model_prev = deepcopy(
+            model.module if "DataParallel" == model.__class__.__name__ else model
+        )
+        self.model_prev.zero_grad()
+
 
         # store the whole training arguments.
         self.conf = conf
+        self.consensus_stepsize = conf.gamma
         self.use_cuda = conf.on_cuda
-        self.gamma = conf.gamma
-        self.eta = conf.eta
-        self.eta_ratio = self.eta / conf.lr 
-        self.beta = conf.beta
 
         if self.conf.lr_change_epochs is not None:
             self.lr_schedule = [ int(ep) for ep in self.conf.lr_change_epochs.split(",") ]
@@ -100,7 +105,6 @@ class FSPDA(Optimizer): # current implementation uses local updates
         # define auxilary functions.
         self.helper_thread = None
         self.sync_buffer = {}
-        self.sync_buffer_gt = {}
         self.n_bits = 0
         self.first_step = True
 
@@ -110,7 +114,7 @@ class FSPDA(Optimizer): # current implementation uses local updates
     
     
     def __setstate__(self, state):
-        super(FSPDA, self).__setstate__(state)
+        super(GT, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
 
@@ -119,110 +123,91 @@ class FSPDA(Optimizer): # current implementation uses local updates
         loss = criterion(output, _target)
         return loss
 
-
-    def get_lambda(self, param_groups, param_names):
+    def get_prm(self, param_groups, param_names, tag="params"):
         data = []
         for idx, _ in param_names:
-            _data = param_groups[idx]["lambdas"][0]
-            if _data is not None:
-                data.append(_data)
-        flatten_lambda = TensorBuffer(data, self.use_cuda)
-        return data, flatten_lambda
-    
-    def get_prm(self, param_groups, param_names):
-        data = []
-        for idx, _ in param_names:
-            _data = param_groups[idx]["params"][0]
+            _data = param_groups[idx][tag][0]
             if _data is not None:
                 data.append(_data)
         flatten_params = TensorBuffer(data, self.use_cuda)
         return data, flatten_params
+
+    def get_gt(self, param_groups, param_names):
+        return self.get_prm(param_groups, param_names, tag="gt")
+
+    def get_prev_grad(self, param_groups, param_names):
+        return self.get_prm(param_groups, param_names, tag="prev_grad")
     
     def get_zeros_prm_buffer(self, param_groups, param_names):
         _, flatten_params = self.get_prm(param_groups, param_names)
         flatten_params.buffer = torch.zeros_like(flatten_params.buffer)
         return flatten_params
 
-    def update_eta(self):
-        if self.conf.lr_change_epochs is not None:
-            if len(self.lr_schedule) > 0 and self.conf.epoch_ >= self.lr_schedule[0]:
-                self.lr_schedule.pop(0)
-                self.eta /= self.conf.lr_decay
-                print("eta decay: eta = {}".format(self.eta))
     
+    def L2_regularize_grad(self, model):
+        weight_decay = self.conf.weight_decay
+        if weight_decay > 0:
+            for key, prm in model.named_parameters():
+                if not "bn" in key and weight_decay != 0:
+                    prm.grad.data = prm.grad.data.detach().clone() + weight_decay * prm.data.detach().clone()
+      
     
     def step(self, **kwargs):
-        self.update_eta()
         self.n_bits = 0
         lr = kwargs["scheduler"].get_lr()
         self.lr = lr if not lr is None else self.lr
-        self.eta = self.lr * self.eta_ratio
+
+        self.L2_regularize_grad(self.model)
         params, flatten_params = self.get_prm(self.param_groups, self.param_names)
             
-        # draw new \xi
+        # draw new random graph \xi^t
         self.compressor.prepare_round(flatten_params, self.it)
 
          #  ==== do aggregates ==== 
         params, flatten_params = self.get_prm(self.param_groups, self.param_names)
+        _, flatten_gt = self.get_gt(self.param_groups, self.param_names)
 
         # start compress/sync.
         self.sync_buffer = {
             "original_shapes": self.shapes,
             "flatten_params": flatten_params,
+            "flatten_gt": flatten_gt,
             "edge_result": {},
             "n_bits": 0
         }
-
-        # self.helper_thread = utils.HelperThread(
-        #     name=f"_thread_at_epoch_{self.conf.epoch_}.compress",
-        #     func=self.compressor.pipeline,
-        #     # the arguments below will be feeded into the `func`.
-        #     sync_buffer=self.sync_buffer,
-        # )
-        # self.helper_thread.start()
 
         self.compressor.pipeline(self.sync_buffer)
         utils.join_thread(self.helper_thread)
         self.n_bits += self.sync_buffer.get("n_bits", 0)
         #  ==== end of aggregates, results stored in self.sync_buffer["edge_result"][nei] ==== 
 
-        #  ==== primal update ==== 
-        # compute unnormalized laplacian @ x^t
-        agg_buffer = self.get_zeros_prm_buffer(self.param_groups, self.param_names)
+        params, flatten_params = self.get_prm(self.param_groups, self.param_names)
         for nei in self.sync_buffer["edge_result"]:
-            sparse_values, indices = self.sync_buffer["edge_result"][nei]
-            agg_buffer.buffer[ indices ] -= self.gamma * (flatten_params.buffer[indices] - sparse_values)
-        
-        # end of sparse graph gossip
-            
-        _lambda, flatten_lambda = self.get_lambda(self.param_groups, self.param_names)
-        agg_buffer.buffer -= self.eta * flatten_lambda.buffer
-        # end of applying dual variable 
+            _, prm_values, indices = self.sync_buffer["edge_result"][nei]
+            _, my_prm_values, _ = self.sync_buffer["send_dict"][nei]
+            flatten_params.buffer[ indices ] -= self.consensus_stepsize * (my_prm_values - prm_values)
 
-        # apply prm.grad + weight_decay to local model
-        utils.apply_gradient(
-            self.param_groups, self.state, apply_grad_to_model=True, set_model_prm_as_grad=False
-        )
-               
-        params, flatten_params = self.get_prm(self.param_groups, self.param_names) # get flatten_params after gradient update
-        flatten_params.buffer = flatten_params.buffer + agg_buffer.buffer
         flatten_params.unpack(params)
 
-        #  ==== completed primal update ==== 
+        for groups in self.param_groups:
+            for gt, prm in zip(groups["gt"], groups["params"]):
+                prm.data -= self.lr * gt.data.detach().clone()
 
-        #  ==== dual update using the same gossip information from self.sync_buffer["edge_result"][nei] ==== 
-        # dual =  dual + beta * dual_grad
-        dual_grad_buffer = self.get_zeros_prm_buffer(self.param_groups, self.param_names)
-        for nei in self.neighbors_info:
-            if nei in self.sync_buffer["edge_result"]:
-                sparse_values, indices = self.sync_buffer["edge_result"][nei]
-                dual_grad_buffer.buffer[ indices ] += flatten_params.buffer[indices] - sparse_values
-        
-        # perform dual update
-        _lambda, flatten_lambda = self.get_lambda(self.param_groups, self.param_names)
-        flatten_lambda.buffer = flatten_lambda.buffer + self.beta * dual_grad_buffer.buffer
-        flatten_lambda.unpack(_lambda)
-        
+        # GT update
+
+        grad_tracker, flatten_gt = self.get_gt(self.param_groups, self.param_names)
+        for nei in self.sync_buffer["edge_result"]:
+            gt_values, _, indices = self.sync_buffer["edge_result"][nei]
+            my_gt_values, _, _ = self.sync_buffer["send_dict"][nei]
+            flatten_gt.buffer[ indices ] -= self.consensus_stepsize * (my_gt_values - gt_values)
+        flatten_gt.unpack(grad_tracker)
+
+        for groups in self.param_groups:
+            for gt, prm, pgrd in zip(groups["gt"], groups["params"], groups["prev_grad"]):
+                gt.data += prm.grad.data.detach().clone() - pgrd.data.detach().clone()
+                pgrd.data = prm.grad.data.detach().clone()
+
+
         self.it += 1
         return self.n_bits
 
@@ -275,7 +260,7 @@ class RandomGraph_Sparsifier(object):
 
     def sample_random_graph(self, flatten_params, it):
         if self.kargs["one_edge"]:
-            # implemented 1 edge random graph, where initiator randomly selects one neighbor
+            # implemented 1 edge random graph
             initiator = int(it % self.world_size)
             if self.aggregator_fn.rank == initiator:
                 # I am initiator this round
@@ -294,6 +279,8 @@ class RandomGraph_Sparsifier(object):
             else:
                 active_neighbors = []
                 edge_masks = {}
+            
+            # print(self.aggregator_fn.rank, initiator, rand_neigh)
         else:
             # edge_activation decides whether an edge is active or not
             edge_activation = {nei: torch.rand(1) for nei in self.aggregator_fn.neighbor_ranks}
@@ -342,44 +329,52 @@ class RandomGraph_Sparsifier(object):
         for nei in self.active_neighbors:
             selected_indices = self.edge_masks[nei]
             selected_values = []
+            selected_gt_values = []
 
-            for param, _selected_indices in zip(sync_buffer["flatten_params"], selected_indices):
+            for param, prev_param, _selected_indices in zip(sync_buffer["flatten_params"], sync_buffer["flatten_gt"], selected_indices):
                 _selected_values = param.view(-1)[_selected_indices]
                 selected_values.append(_selected_values)
+
+                _selected_gt_values = prev_param.view(-1)[_selected_indices]
+                selected_gt_values.append(_selected_gt_values)
             
             selected_shapes = [len(_value) for _value in selected_values]
 
             flatten_selected_values = TensorBuffer(selected_values, self.use_cuda)
+            flatten_selected_gt_values = TensorBuffer(selected_gt_values, self.use_cuda)
             flatten_selected_indices = TensorBuffer(selected_indices, self.use_cuda)
 
             noise = torch.zeros_like(flatten_selected_values.buffer).uniform_(-self.compression_noise, self.compression_noise)
             flatten_selected_values.buffer += noise
 
-            sync_buffer["send_dict"][nei] = [flatten_selected_values.buffer, flatten_selected_indices.buffer]
+            sync_buffer["send_dict"][nei] = [flatten_selected_gt_values.buffer, flatten_selected_values.buffer, flatten_selected_indices.buffer]
 
             sync_buffer["selected_shapes"][nei] = selected_shapes
             if self.comm_device == "cpu":
                 sync_buffer["send_dict"][nei][0] = sync_buffer["send_dict"][nei][0].cpu().pin_memory()
                 sync_buffer["send_dict"][nei][1] = sync_buffer["send_dict"][nei][1].cpu().pin_memory()
+                sync_buffer["send_dict"][nei][2] = sync_buffer["send_dict"][nei][2].cpu().pin_memory()
             
             # get n_bits to transmit.
             if self.compress_ratio > 0:
                 if self.aggregator_fn.rank > nei:
-                    n_bits = get_n_bits(flatten_selected_values.buffer) + get_n_bits(
+                    n_bits = get_n_bits(flatten_selected_values.buffer) * 2 + get_n_bits(
                         flatten_selected_indices.buffer
                     )
                 else:
-                    n_bits = get_n_bits(flatten_selected_values.buffer)
+                    n_bits = get_n_bits(flatten_selected_values.buffer) * 2
             else:
                 # no sparsification is applied
-                n_bits = get_n_bits(flatten_selected_values.buffer)
+                n_bits = get_n_bits(flatten_selected_values.buffer) * 2
             sync_buffer["n_bits"] += n_bits
 
     def sync(self, sync_buffer):
         # sync.
         sync_buffer["recv_dict"] = {}
         for rank in sync_buffer["send_dict"]:
-            sync_buffer["recv_dict"][rank] = [torch.empty_like(sync_buffer["send_dict"][rank][0]), torch.empty_like(sync_buffer["send_dict"][rank][1])]
+            sync_buffer["recv_dict"][rank] = [torch.empty_like(sync_buffer["send_dict"][rank][0]), 
+                                              torch.empty_like(sync_buffer["send_dict"][rank][1]),
+                                              torch.empty_like(sync_buffer["send_dict"][rank][2])]
 
         sync_message_reqs, synced_message = self.aggregator_fn.two_way_sendrecv_with_tags(sync_buffer["send_dict"], sync_buffer["recv_dict"], 
                         force_wait=False, active_neighbors=self.active_neighbors)
@@ -395,7 +390,7 @@ class RandomGraph_Sparsifier(object):
         # uncompress and update.
         for rank in self.active_neighbors:
             # recover values/indices to the correct device.
-            q_values, q_indices = self._uncompress_helper(
+            prev_q_values, q_values, q_indices = self._uncompress_helper(
                 sync_buffer["flatten_params"].buffer.device,
                 rank,
                 sync_buffer["synced_message"],
@@ -404,8 +399,8 @@ class RandomGraph_Sparsifier(object):
             )
 
             # have (rank)-neighbour sparse param here
-            sync_buffer["edge_result"][rank] = (q_values, q_indices) # can be used directly on buffer
-            
+            sync_buffer["edge_result"][rank] = (prev_q_values, q_values, q_indices) # can be used directly on buffer
+        
     def _uncompress_helper(
         self,
         _device,
@@ -415,15 +410,21 @@ class RandomGraph_Sparsifier(object):
         original_shapes,
     ):
         # recover the message and the corresponding device.
-        values = comm.recover_device(
+        gt_values = comm.recover_device(
             synced_message[_rank][0], device=_device
         )
-        indices = comm.recover_device(
+        values = comm.recover_device(
             synced_message[_rank][1], device=_device
+        )
+        indices = comm.recover_device(
+            synced_message[_rank][2], device=_device
         )
 
         # deal with unbalanced values/indieces
         q_values, q_indices = self.compressor_fn.uncompress(
             values, indices, selected_shapes[_rank], original_shapes
         )
-        return q_values, q_indices
+        gt_q_values, q_indices = self.compressor_fn.uncompress(
+            gt_values, indices, selected_shapes[_rank], original_shapes
+        )
+        return gt_q_values, q_values, q_indices

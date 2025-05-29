@@ -29,6 +29,10 @@ class SparsificationCompressor(object):
                 x_data.abs(), top_k, largest=True, sorted=False
             )
         return x_data[selected_indices], selected_indices
+    
+    def get_values(self, x, mask):
+        x_data = x.view(-1)
+        return x_data[mask]
 
     def get_mask(self, flatten_arr, indices):
         mask = torch.zeros_like(flatten_arr)

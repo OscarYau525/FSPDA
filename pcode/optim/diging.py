@@ -43,7 +43,7 @@ class DIGing(Optimizer):
         # store the whole training arguments.
         self.conf = conf
         self.rank = conf.graph.rank
-        self.edge_fraction = conf.edge_fraction
+        self.edge_prob = conf.edge_prob
         self.neighbors_info = conf.graph.get_neighborhood()
         torch.manual_seed(self.rank)
 
@@ -157,7 +157,7 @@ class DIGing(Optimizer):
         else:
             edge_activation = {nei: torch.rand(1) for nei in self.decentralized_aggregator.neighbor_ranks}
             edge_activation = self.decentralized_aggregator.one_way_consensus(edge_activation, force_wait=True)
-            self.active_neighbors = [nei for nei in edge_activation if edge_activation[nei] <= self.edge_fraction]
+            self.active_neighbors = [nei for nei in edge_activation if edge_activation[nei] <= self.edge_prob]
 
         # comm prms
         with kargs["timer"]("sync.update_theta", epoch=self.conf.epoch_):

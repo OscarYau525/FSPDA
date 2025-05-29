@@ -9,7 +9,7 @@ import pcode.utils.communication as comm
 
 from pcode.utils.tensor_buffer import TensorBuffer
 from pcode.create_dataset import load_data_batch
-from .parallel_choco_v import CHOCOCompressor, RandomNodeActivation_Sparsifier
+from .parallel_choco_v import CHOCOCompressor, RandomGraphCompressor
 
 
 class ParallelBEER_V(Optimizer):
@@ -74,7 +74,7 @@ class ParallelBEER_V(Optimizer):
 
         # related to sparsification/quantization.
         if self.conf.node_fraction < 1:
-            self.compressor = RandomNodeActivation_Sparsifier(
+            self.compressor = RandomGraphCompressor(
                 aggregator=self.aggregator,
                 comm_op=conf.comm_op,
                 comm_device=self.conf.comm_device,
@@ -229,15 +229,14 @@ class ParallelBEER_V(Optimizer):
                 "n_bits": 0
             }
 
-            if isinstance(self.compressor, RandomNodeActivation_Sparsifier):
-                self.compressor.prepare_round(self.sync_buffer_gt, self.it)
+            if isinstance(self.compressor, RandomGraphCompressor):
+                self.compressor.prepare_round(self.it)
 
             self.helper_thread = utils.HelperThread(
                 name=f"_thread_at_epoch_{self.conf.epoch_}.compress",
                 func=self.compressor.pipeline,
                 # the arguments below will be feeded into the `func`.
                 sync_buffer=self.sync_buffer_gt,
-                neighbor_hat_params=self.neighbor_hat_gt,
                 neighbors_info=self.neighbors_info,
             )
             self.helper_thread.start()
@@ -245,7 +244,7 @@ class ParallelBEER_V(Optimizer):
             n_bits += self.sync_buffer_gt.get("n_bits", 0) 
 
             # update neighbor_hat_gt[self.rank]
-            if isinstance(self.compressor, RandomNodeActivation_Sparsifier):
+            if isinstance(self.compressor, RandomGraphCompressor):
                 neighborhood = self.compressor.active_neighbors
                 active = self.compressor.active
             else:
@@ -310,8 +309,8 @@ class ParallelBEER_V(Optimizer):
         }
 
 
-        if isinstance(self.compressor, RandomNodeActivation_Sparsifier):
-            self.compressor.prepare_round(self.sync_buffer, self.it)
+        if isinstance(self.compressor, RandomGraphCompressor):
+            self.compressor.prepare_round(self.it)
 
         
         
@@ -320,7 +319,6 @@ class ParallelBEER_V(Optimizer):
             func=self.compressor.pipeline,
             # the arguments below will be feeded into the `func`.
             sync_buffer=self.sync_buffer,
-            neighbor_hat_params=self.neighbor_hat_params,
             neighbors_info=self.neighbors_info,
         )
         self.helper_thread.start()
@@ -329,7 +327,7 @@ class ParallelBEER_V(Optimizer):
         
         
         # update neighbor_hat_params[self.rank]
-        if isinstance(self.compressor, RandomNodeActivation_Sparsifier):
+        if isinstance(self.compressor, RandomGraphCompressor):
             neighborhood = self.compressor.active_neighbors
             active = self.compressor.active
         else:

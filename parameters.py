@@ -84,15 +84,29 @@ def get_args():
     parser.add_argument("--base_batch_size", default=None, type=int)
     parser.add_argument("--initial_batch_num", default=None, type=int) # for GT-HSGD
     parser.add_argument("--true_gradient", default=False, type=str2bool)
+    parser.add_argument("--loss", default="cross_entropy", type=str)
 
     # for time varying setup
-    # PProx-SPDA / FSPDA
+    # PProx-SPDA / FSPPD
     parser.add_argument("--eta", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=0.0)
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--omega", type=float, default=1.0)
-    parser.add_argument("--edge_fraction", type=float, default=0.0)
+    parser.add_argument("--edge_prob", type=float, default=0.0)
     parser.add_argument("--one_edge", type=str2bool, default=False)
+
+    # FSPDA-STORM
+    parser.add_argument("--storm_momentum", type=float, default=0.01)
+    parser.add_argument("--storm_dual_momentum", type=float, default=0.01)
+
+    # FSPDA-ADAM
+    parser.add_argument("--adam_primal_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_primal_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_dual_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_dual_beta2", type=float, default=0.999)
+
+    # Prox-Skip
+    parser.add_argument("--gossip_prob", type=float, default=1.0)
 
     # CHOCO-SGD
     parser.add_argument("--node_fraction", type=float, default=1.0)
@@ -102,7 +116,22 @@ def get_args():
 
     # TiCoPD
     parser.add_argument("--theta", type=float, default=0.0)
+    parser.add_argument("--random_lap", type=str2bool, default=True)
+    parser.add_argument("--use_compressor_buffer", type=str2bool, default=False)
+    parser.add_argument("--compression_noise", type=float, default=0.0)
+    parser.add_argument("--shared_mask", type=str2bool, default=False)
 
+    # DIMIX
+    parser.add_argument("--tau", type=float, default=0.0)
+    parser.add_argument("--nu", type=float, default=0.0)
+    parser.add_argument("--mu", type=float, default=0.0)
+
+    # DEF-ATC
+    parser.add_argument("--zeta", type=float, default=1.0)
+
+    # K-GT
+    parser.add_argument("--local_steps", type=int, default=1)
+    parser.add_argument("--eta_s", type=float, default=1.0)
 
     # Di-CS-SVRG
     parser.add_argument("--SVRG", type=str2bool, default=False)
@@ -237,6 +266,7 @@ def get_args():
     parser.add_argument("--display_tracked_time", default=False, type=str2bool)
     parser.add_argument("--eval_grad", type=str2bool, default=True)
     parser.add_argument("--eval_worst", type=str2bool, default=True, help="evaluate every local model and log the worst performance.")
+    parser.add_argument("--eval_avg", type=str2bool, default=True, help="evaluate the performance at the average iterate.")
     # parser.add_argument("--evaluate_avg", default=False, type=str2bool)
 
     # checkpoint
@@ -296,6 +326,12 @@ def get_args():
     parser.add_argument("--clean_python", default=False, type=str2bool)
 
     parser.add_argument("--log_eval", type=str2bool, default=False)
+
+    # for synthetic data
+    parser.add_argument("--data_dim", type=int, default=1000)
+    parser.add_argument("--num_classes", type=int, default=10)
+    parser.add_argument("--num_train_samples", type=int, default=1000)
+
 
 
     # parse conf.

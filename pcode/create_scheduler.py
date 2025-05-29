@@ -39,19 +39,23 @@ class Scheduler(object):
         # init
         self.conf = conf
         self.local_index = 0 if "local_index" not in conf else conf.local_index
+        self.epoch_ = 0
+        self.epoch = 0
         self.init_learning_rate()
         self.init_lr_scheduler()
         self.init_eval_timepoints()
 
     def init_eval_timepoints(self):
         n_points = self.conf.eval_n_points
-        if self.conf.log_eval:
+        self.eval_n_points = n_points
+        self.log_eval = self.conf.log_eval
+        if self.log_eval:
             end_it = self.conf.num_iterations
             self.eval_timepoints = sorted(list(
                     set([int(2**( i/n_points * log2(end_it))) for i in range(n_points+1)])
                     ))
         else:
-            self.eval_timepoints = [int(i * self.conf.num_iterations // n_points) for i in range(1, n_points+1)]
+            self.eval_timepoints = [int(i * self.conf.num_iterations // n_points) for i in range(0, n_points+1)]
 
     def update_from_checkpoint(self, checkpoint):
         self.conf.local_index = checkpoint["local_index"]

@@ -6,6 +6,6 @@ from .vgg import *
 from .rnn_lm import *
 from .lenet import *
 from .lenet_sigmoid import *
-from .linear_regression import *
+from .linear import *
 from .feedforward import *
 from .cnn3 import *

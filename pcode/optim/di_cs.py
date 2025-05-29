@@ -63,7 +63,7 @@ class Di_CS(Optimizer):
         self.B = conf.B_connected
         self.T = conf.outer_loop_T
         self.svrg = conf.SVRG
-        self.edge_fraction = conf.edge_fraction
+        self.edge_prob = conf.edge_prob
         self.B_round_active_neighbours = set()
         self.it = 0
 
@@ -110,7 +110,7 @@ class Di_CS(Optimizer):
             is_biased=conf.is_biased,
             backend=conf.backend,
             use_ipc=conf.use_ipc,
-            edge_fraction=self.edge_fraction
+            edge_prob=self.edge_prob
         )
 
         # define auxilary functions.
@@ -419,7 +419,7 @@ class Di_CS_DirectedGraph_Sparsifier(object):
         edge_activation = {nei: torch.rand(1) for nei in self.aggregator_fn.neighbor_ranks}
         edge_activation = self.aggregator_fn.one_way_consensus(edge_activation, force_wait=True)
 
-        self.active_neighbors = [nei for nei in edge_activation if edge_activation[nei] <= self.kwargs["edge_fraction"]]
+        self.active_neighbors = [nei for nei in edge_activation if edge_activation[nei] <= self.kwargs["edge_prob"]]
         self.edge_masks = {nei: self.prepare_compress(flatten_params) for nei in self.active_neighbors}
         
     def set_edge_mask_from_edge_result(self, edge_result, recv_selected_shapes, original_shapes):

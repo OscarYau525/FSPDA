@@ -87,7 +87,6 @@ class SwarmSGD(Optimizer): # current implementation uses local updates
             aggregator_type="centralized",
         )
 
-        self.edge_fraction = conf.edge_fraction
         self.it = 0
 
         # initialize buffers for gossips
